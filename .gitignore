@@ -39,3 +39,4 @@ data/
 # Databases
 *.db
 .vercel
+vector_store/chroma_db/

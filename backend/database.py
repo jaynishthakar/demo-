@@ -17,10 +17,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+DEFAULT_SIGNUP_DOMAINS = ["spit.ac.in", "vit.edu.in"]
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, nullable=False, index=True)
+    email = Column(String, unique=True, nullable=True, index=True)
     hashed_password = Column(String, nullable=False)
     role = Column(String, nullable=False)  # 'Public','Student','Faculty','Admin'
     is_committee_head = Column(Boolean, nullable=False, default=False)
@@ -47,6 +51,21 @@ class CommitteeUpload(Base):
     reviewed_at = Column(DateTime, nullable=True)
     doc_id = Column(String, nullable=True)
     submitted_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SignupDomain(Base):
+    """Admin-managed email-domain allowlist for self-service signup.
+
+    When no rows are `enabled`, signup is open to any email. As soon as one or
+    more domains are enabled, only emails on that allowlist may register — every
+    other domain is blocked. The two seeded defaults start disabled so signup
+    stays open until an admin deliberately turns one on."""
+    __tablename__ = "signup_domains"
+    id = Column(Integer, primary_key=True, index=True)
+    domain = Column(String, unique=True, nullable=False, index=True)
+    enabled = Column(Boolean, nullable=False, default=False)
+    is_default = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ChatMessage(Base):
@@ -92,6 +111,7 @@ def migrate_user_columns():
     conn = engine.raw_connection()
     try:
         cursor = conn.cursor()
+        _ensure_column(cursor, "users", "email", "TEXT")
         _ensure_column(cursor, "users", "is_committee_head", "BOOLEAN NOT NULL DEFAULT 0")
         _ensure_column(cursor, "users", "committee_name", "TEXT")
         _ensure_column(cursor, "users", "department", "TEXT")
@@ -103,6 +123,33 @@ def migrate_user_columns():
         conn.close()
 
 
+def seed_default_domains():
+    """Ensures the two canonical college domains exist as (disabled) defaults."""
+    db = SessionLocal()
+    try:
+        for domain in DEFAULT_SIGNUP_DOMAINS:
+            if not db.query(SignupDomain).filter(SignupDomain.domain == domain).first():
+                db.add(SignupDomain(domain=domain, enabled=False, is_default=True))
+        db.commit()
+    finally:
+        db.close()
+
+
+def auto_approve_pending_users():
+    """Signup approval was removed — free any accounts still stuck as 'pending'."""
+    db = SessionLocal()
+    try:
+        db.query(User).filter(User.approval_status == "pending").update(
+            {User.approval_status: "approved", User.rejection_reason: None},
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     migrate_user_columns()
+    seed_default_domains()
+    auto_approve_pending_users()

@@ -159,6 +159,7 @@ function renderLanding() {
 let authMode = 'login'; // 'login' | 'signup'
 let signupRole = 'Student'; // 'Student' | 'Faculty'
 let DEPARTMENTS = [];
+let SIGNUP_POLICY = { restricted: false, domains: [] };
 
 async function loadDepartments() {
   if (DEPARTMENTS.length) return DEPARTMENTS;
@@ -167,6 +168,14 @@ async function loadDepartments() {
     if (r.ok) DEPARTMENTS = (await r.json()).departments || [];
   } catch {}
   return DEPARTMENTS;
+}
+
+async function loadSignupPolicy() {
+  try {
+    const r = await fetch(`${API}/api/auth/signup-domains`);
+    if (r.ok) SIGNUP_POLICY = await r.json();
+  } catch {}
+  return SIGNUP_POLICY;
 }
 
 function authModalHTML() {
@@ -188,6 +197,8 @@ function authModalHTML() {
         </div>
       </div>` : ''}
       <div class="field"><label>Username</label><input id="u" placeholder="e.g. student_test" autocomplete="off" required></div>
+      ${isSignup ? `<div class="field"><label>Email</label><input id="email" type="email" placeholder="you@college.edu.in" autocomplete="off" required></div>` : ''}
+      ${isSignup && SIGNUP_POLICY.restricted ? `<p class="auth-hint">Registration is open only to: ${SIGNUP_POLICY.domains.map(d => '@' + esc(d)).join(', ')}</p>` : ''}
       <div class="field"><label>Password</label><input id="p" type="password" placeholder="••••••••" autocomplete="off" required></div>
       ${isSignup ? `<div class="field"><label>Confirm password</label><input id="p2" type="password" placeholder="••••••••" autocomplete="off" required></div>` : ''}
       ${isSignup ? `<div class="field"><label>Department</label><select id="dept" required>
@@ -216,7 +227,7 @@ function setSignupRole(role) {
 
 async function switchAuthMode(mode) {
   authMode = mode;
-  if (mode === 'signup') await loadDepartments();
+  if (mode === 'signup') { await loadDepartments(); await loadSignupPolicy(); }
   $('authCard').innerHTML = authModalHTML();
 }
 
@@ -264,11 +275,24 @@ async function doLogin(e) {
 async function doSignup(e) {
   e.preventDefault();
   const err = $('loginErr'); const msg = $('loginMsg');
-  err.classList.remove('show'); msg.style.display = 'none';
+  err.classList.remove('show'); if (msg) msg.style.display = 'none';
   const password = $('p').value, confirm = $('p2').value;
   if (password !== confirm) {
     err.textContent = 'Passwords do not match.'; err.classList.add('show');
     return;
+  }
+  const email = ($('email').value || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    err.textContent = 'Please enter a valid email address.'; err.classList.add('show');
+    return;
+  }
+  if (SIGNUP_POLICY.restricted) {
+    const domain = email.split('@')[1].toLowerCase();
+    if (!SIGNUP_POLICY.domains.includes(domain)) {
+      err.textContent = `Registration is open only to: ${SIGNUP_POLICY.domains.map(d => '@' + d).join(', ')}.`;
+      err.classList.add('show');
+      return;
+    }
   }
   const department = $('dept').value;
   if (!department) {
@@ -280,15 +304,16 @@ async function doSignup(e) {
   try {
     const r = await fetch(`${API}/api/auth/signup`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: $('u').value, password, role: signupRole, department }),
+      body: JSON.stringify({ username: $('u').value, email, password, role: signupRole, department }),
     });
     const d = await r.json().catch(() => ({}));
-    if (r.ok) {
-      const successMsg = d.message || 'Your account has been submitted and is awaiting admin approval.';
-      await switchAuthMode('login');
-      const newMsg = $('loginMsg');
-      newMsg.textContent = successMsg;
-      newMsg.style.display = 'block';
+    if (r.ok && d.access_token) {
+      // Account is active immediately — sign the user straight in.
+      S.token = d.access_token; S.user = d.username; S.role = d.role; S.isPublic = false;
+      S.isCommitteeHead = !!d.is_committee_head; S.committeeName = d.committee_name || null;
+      saveSession();
+      await loadHistory();
+      renderApp();
     } else {
       err.textContent = d.detail || 'Something went wrong.'; err.classList.add('show');
     }
@@ -408,7 +433,7 @@ function go(view) {
   else if (view === 'documents') { scroll.innerHTML = `<div class="view">${documentsHTML()}</div>`; loadDocuments(); }
   else if (view === 'users') { scroll.innerHTML = `<div class="view">${usersHTML()}</div>`; }
   else if (view === 'my-sops') { scroll.innerHTML = `<div class="view">${mySopsHTML()}</div>`; loadMyUploads(); }
-  else if (view === 'approvals') { scroll.innerHTML = `<div class="view">${approvalsHTML()}</div>`; loadPendingSignups(); loadPendingApprovals(); }
+  else if (view === 'approvals') { scroll.innerHTML = `<div class="view">${approvalsHTML()}</div>`; loadPendingApprovals(); }
   else { scroll.innerHTML = `<div class="view">${dashboardHTML(view)}</div>`; }
 }
 
@@ -761,49 +786,8 @@ async function loadMyUploads() {
 /* ═══════════════════════════════════════════════════════════════════ ADMIN: APPROVALS */
 function approvalsHTML() {
   return `
-  <div class="sec-head"><h3>Pending signups</h3></div>
-  <div id="signupsList"><p style="color:var(--text-3);font-size:.88rem">Loading…</p></div>
-  <div class="sec-head" style="margin-top:2rem"><h3>Pending SOP approvals</h3></div>
+  <div class="sec-head"><h3>Pending SOP approvals</h3></div>
   <div id="approvalsList"><p style="color:var(--text-3);font-size:.88rem">Loading…</p></div>`;
-}
-
-async function loadPendingSignups() {
-  const el = $('signupsList'); if (!el) return;
-  let rows = [];
-  try {
-    const r = await fetch(`${API}/api/admin/pending-signups`, { headers: { 'Authorization': `Bearer ${S.token}` } });
-    if (r.ok) rows = await r.json();
-  } catch {}
-  if (!rows.length) { el.innerHTML = `<p style="color:var(--text-3);font-size:.88rem">Nothing pending review.</p>`; return; }
-  el.innerHTML = rows.map(u => `
-    <div class="uprow">
-      <div class="l"><span class="ic">${u.role === 'Faculty' ? I.flask : I.grade}</span><div><div class="nm">${esc(u.username)}</div><div class="sz">${esc(u.role)} · ${esc(u.department || '—')} · ${new Date(u.created_at).toLocaleString()}</div></div></div>
-      <div style="display:flex;gap:.5rem">
-        <button class="btn btn-accent" style="padding:.3rem .7rem;font-size:.82rem" onclick="approveSignup(${u.id})">Approve</button>
-        <button class="btn btn-ghost" style="padding:.3rem .7rem;font-size:.82rem" onclick="rejectSignup(${u.id})">Reject</button>
-      </div>
-    </div>`).join('');
-}
-
-async function approveSignup(id) {
-  try {
-    const r = await fetch(`${API}/api/admin/signups/${id}/approve`, { method: 'POST', headers: { 'Authorization': `Bearer ${S.token}` } });
-    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Approval failed.'); }
-  } catch { alert('Cannot reach the server.'); }
-  loadPendingSignups();
-}
-
-async function rejectSignup(id) {
-  const reason = prompt('Reason for rejection:');
-  if (!reason || !reason.trim()) return;
-  try {
-    await fetch(`${API}/api/admin/signups/${id}/reject`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${S.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason: reason.trim() }),
-    });
-  } catch {}
-  loadPendingSignups();
 }
 
 async function loadPendingApprovals() {
@@ -963,7 +947,9 @@ async function loadUsers() {
   };
 
   scroll.innerHTML = `<div class="view">
-    <div class="sec-head"><h3>User directory</h3><span class="chip">${rows.length} accounts</span></div>
+    <div class="sec-head"><h3>Signup access</h3></div>
+    <div id="signupAccessCard"><p style="color:var(--text-3);font-size:.88rem">Loading…</p></div>
+    <div class="sec-head" style="margin-top:2rem"><h3>User directory</h3><span class="chip">${rows.length} accounts</span></div>
     ${groups.map(g => `
       <div class="sec-head" style="margin-top:1.4rem;margin-bottom:.6rem">
         <h3 style="font-size:.9rem;color:var(--text-2)">${esc(g.role)} <span style="color:var(--text-3);font-weight:400">(${g.users.length})</span></h3>
@@ -973,6 +959,84 @@ async function loadUsers() {
         ${g.users.map(userRow).join('')}
       </div>`).join('')}
   </div>`;
+
+  loadSignupDomains();
+}
+
+/* ═══════════════════════════════════════════════════════════════════ ADMIN: SIGNUP DOMAINS
+   Controls whether self-service signup is open to any email or restricted to an
+   allowlist. With no domain enabled, signup is open. Enabling one or more domains
+   blocks every other domain; matching emails register pre-approved. */
+async function loadSignupDomains() {
+  const el = $('signupAccessCard'); if (!el) return;
+  let rows = [];
+  try {
+    const r = await fetch(`${API}/api/admin/signup-domains`, { headers: { 'Authorization': `Bearer ${S.token}` } });
+    if (r.ok) rows = await r.json();
+  } catch {}
+
+  const anyOn = rows.some(d => d.enabled);
+  const list = rows.map(d => `
+    <div class="uprow">
+      <div class="l"><span class="ic">${I.shield}</span><div>
+        <div class="nm">@${esc(d.domain)}${d.is_default ? ' <span class="role-pill">default</span>' : ''}</div>
+        <div class="sz">${d.enabled ? 'Allowed — signups from this domain are pre-approved' : 'Off'}</div>
+      </div></div>
+      <div style="display:flex;gap:.5rem;align-items:center">
+        <button class="btn ${d.enabled ? 'btn-accent' : 'btn-ghost'}" style="padding:.3rem .8rem;font-size:.82rem" onclick="toggleSignupDomain(${d.id}, ${!d.enabled})">${d.enabled ? 'On' : 'Off'}</button>
+        ${d.is_default ? '' : `<button class="btn btn-ghost" style="padding:.3rem .6rem;font-size:.82rem" onclick="deleteSignupDomain(${d.id}, '${esc(d.domain)}')">Remove</button>`}
+      </div>
+    </div>`).join('');
+
+  el.innerHTML = `
+    <p style="color:var(--text-3);font-size:.85rem;margin:.2rem 0 .8rem">
+      ${anyOn
+        ? 'Signup is <b>restricted</b> — only the domains switched <b>On</b> below can register. All other email domains are blocked.'
+        : 'Signup is <b>open</b> to any email. Switch a domain On to restrict registration to it (and any other enabled domain).'}
+    </p>
+    ${list || '<p style="color:var(--text-3);font-size:.88rem">No domains configured.</p>'}
+    <div style="display:flex;gap:.5rem;margin-top:.9rem">
+      <input id="newDomain" placeholder="add a domain, e.g. college.edu.in"
+        style="flex:1;padding:.5rem .7rem;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text-1);font-size:.85rem"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();addSignupDomain();}">
+      <button class="btn btn-accent" style="padding:.5rem 1rem;font-size:.85rem" onclick="addSignupDomain()">Add domain</button>
+    </div>`;
+}
+
+async function addSignupDomain() {
+  const inp = $('newDomain'); if (!inp) return;
+  const domain = (inp.value || '').trim();
+  if (!domain) return;
+  try {
+    const r = await fetch(`${API}/api/admin/signup-domains`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${S.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Could not add domain.'); return; }
+  } catch { alert('Cannot reach the server.'); return; }
+  loadSignupDomains();
+}
+
+async function toggleSignupDomain(id, enabled) {
+  try {
+    const r = await fetch(`${API}/api/admin/signup-domains/${id}`, {
+      method: 'PATCH',
+      headers: { 'Authorization': `Bearer ${S.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Could not update domain.'); return; }
+  } catch { alert('Cannot reach the server.'); return; }
+  loadSignupDomains();
+}
+
+async function deleteSignupDomain(id, domain) {
+  if (!confirm(`Remove @${domain} from the allowlist?`)) return;
+  try {
+    const r = await fetch(`${API}/api/admin/signup-domains/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${S.token}` } });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Could not remove domain.'); return; }
+  } catch { alert('Cannot reach the server.'); return; }
+  loadSignupDomains();
 }
 
 async function deleteUser(userId, username) {
@@ -1180,11 +1244,13 @@ Object.assign(window, {
   // admin: documents
   uploadFiles, loadDocuments, removeDocument,
   // admin: users / committee heads
-  setCommitteeHead,
+  setCommitteeHead, deleteUser,
+  // admin: signup domain allowlist
+  loadSignupDomains, addSignupDomain, toggleSignupDomain, deleteSignupDomain,
   // committee head: my SOPs
   uploadCommitteeFile,
   // admin: approvals
-  approveUpload, rejectUpload, previewPendingUpload, downloadPendingUpload, approveSignup, rejectSignup,
+  approveUpload, rejectUpload, previewPendingUpload, downloadPendingUpload,
   // citation document viewer
   openDoc, closeDoc, downloadDoc,
 });

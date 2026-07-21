@@ -9,7 +9,8 @@ Endpoints:
 
   GET  /api/auth/departments      — department dropdown choices
   POST /api/auth/login            — JWT login
-  POST /api/auth/signup           — self-service Student/Faculty signup (pending admin approval)
+  POST /api/auth/signup           — self-service Student/Faculty signup (active immediately)
+  GET  /api/auth/signup-domains   — enabled signup email-domain allowlist (public)
   POST /api/chat                  — public chat (no auth, role=Public)
   POST /api/chat/auth             — authenticated chat (saves history)
   GET  /api/chat/stream           — SSE streaming, public
@@ -43,9 +44,10 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from backend import signup_policy
 from backend.auth import create_access_token, get_current_user, hash_password, verify_password
 from backend.constants import DEPARTMENTS, SIGNUP_ROLES
-from backend.database import ChatMessage, User, get_db, init_db
+from backend.database import ChatMessage, SignupDomain, User, get_db, init_db
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +201,7 @@ class LoginRequest(BaseModel):
 
 class SignupRequest(BaseModel):
     username: str
+    email: str
     password: str
     role: str
     department: str
@@ -253,13 +256,24 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/auth/signup-domains")
+def auth_signup_domains(db: Session = Depends(get_db)):
+    """Public: which email domains (if any) signup is currently restricted to.
+    Used by the signup form to show a hint and pre-validate the email. When
+    `restricted` is false, any email may register."""
+    active = signup_policy.enabled_domains(db)
+    return {"restricted": bool(active), "domains": active}
+
+
 @app.post("/api/auth/signup")
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
-    """Self-service registration for Students and Faculty. Every new account is
-    staged as approval_status='pending' and cannot log in until an Admin
-    approves it. Admin/Committee Head are assigned by an Admin, never
-    self-selected."""
+    """Self-service registration for Students and Faculty. Accounts are active
+    immediately — there is no admin approval step. If the admin has enabled one
+    or more allowed email domains, only emails on that allowlist may register;
+    otherwise any email is accepted. Admin/Committee Head are assigned by an
+    Admin, never self-selected."""
     username = payload.username.strip()
+    email = payload.email.strip().lower()
     password = payload.password
 
     if not (3 <= len(username) <= 32) or not all(c.isalnum() or c in "_-" for c in username):
@@ -267,6 +281,8 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
             status_code=400,
             detail="Username must be 3-32 characters (letters, numbers, _ or -).",
         )
+    if not signup_policy.is_valid_email(email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     if payload.role not in SIGNUP_ROLES:
@@ -274,23 +290,41 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     if payload.department not in DEPARTMENTS:
         raise HTTPException(status_code=400, detail="Please select a valid department.")
 
+    if not signup_policy.is_email_allowed(db, email):
+        allowed = ", ".join("@" + d for d in signup_policy.enabled_domains(db))
+        raise HTTPException(
+            status_code=403,
+            detail=f"Sign-ups are limited to these email domains: {allowed}.",
+        )
+
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=409, detail="That username is already taken.")
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail="An account with that email already exists.")
 
     user = User(
         username=username,
+        email=email,
         hashed_password=hash_password(password),
         role=payload.role,
         department=payload.department,
-        approval_status="pending",
+        approval_status="approved",
     )
     db.add(user)
     db.commit()
     db.refresh(user)
 
+    # Account is active immediately — issue a token so the user is signed straight in.
+    token = create_access_token({"sub": user.username, "role": user.role})
     return {
-        "status":  "pending",
-        "message": "Your account has been submitted and is awaiting admin approval.",
+        "status":            "approved",
+        "access_token":      token,
+        "token_type":        "bearer",
+        "role":              user.role,
+        "username":          user.username,
+        "department":        user.department,
+        "is_committee_head": user.is_committee_head,
+        "committee_name":    user.committee_name,
     }
 
 
@@ -666,6 +700,7 @@ def list_users(
         {
             "id": u.id,
             "username": u.username,
+            "email": u.email,
             "role": u.role,
             "department": u.department,
             "approval_status": u.approval_status,
@@ -1021,72 +1056,92 @@ def admin_reject_upload(
         raise HTTPException(status_code=404, detail=str(exc))
 
 
-@app.get("/api/admin/pending-signups")
-def admin_pending_signups(
+# ── Signup domain allowlist (Admin) ─────────────────────────────────────────────
+# Self-service signup is open by default. Admins can restrict it to specific
+# email domains: enabling one or more domains blocks every other domain, while
+# emails on the allowlist register (pre-approved) as normal.
+class SignupDomainRequest(BaseModel):
+    domain: str
+
+
+class SignupDomainToggle(BaseModel):
+    enabled: bool
+
+
+def _domain_dict(row: SignupDomain) -> dict:
+    return {"id": row.id, "domain": row.domain, "enabled": row.enabled, "is_default": row.is_default}
+
+
+@app.get("/api/admin/signup-domains")
+def admin_list_signup_domains(
     _: User = Depends(_require_admin),
     db: Session = Depends(get_db),
 ):
-    """List Student/Faculty signups awaiting review."""
-    users = (
-        db.query(User)
-        .filter(User.approval_status == "pending")
-        .order_by(User.created_at.asc())
+    """List every configured signup domain and whether it is currently enabled."""
+    rows = (
+        db.query(SignupDomain)
+        .order_by(SignupDomain.is_default.desc(), SignupDomain.domain.asc())
         .all()
     )
-    return [
-        {
-            "id": u.id,
-            "username": u.username,
-            "role": u.role,
-            "department": u.department,
-            "created_at": u.created_at.isoformat() if u.created_at else None,
-        }
-        for u in users
-    ]
+    return [_domain_dict(r) for r in rows]
 
 
-@app.post("/api/admin/signups/{user_id}/approve")
-def admin_approve_signup(
-    user_id: int,
-    current_user: User = Depends(_require_admin),
+@app.post("/api/admin/signup-domains")
+def admin_add_signup_domain(
+    payload: SignupDomainRequest,
+    _: User = Depends(_require_admin),
     db: Session = Depends(get_db),
 ):
-    """Approve a pending Student/Faculty signup, allowing the account to log in."""
-    target = db.query(User).filter(User.id == user_id).first()
-    if target is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-    if target.approval_status != "pending":
-        raise HTTPException(status_code=400, detail=f"Signup already {target.approval_status}.")
+    """Add a custom allowed domain. New custom domains are enabled on creation,
+    which (like enabling any domain) restricts signup to the allowlist."""
+    domain = signup_policy.normalize_domain(payload.domain)
+    if not signup_policy.is_valid_domain(domain):
+        raise HTTPException(status_code=400, detail="Enter a valid domain, e.g. college.edu.in.")
+    if db.query(SignupDomain).filter(SignupDomain.domain == domain).first():
+        raise HTTPException(status_code=409, detail="That domain is already in the list.")
 
-    target.approval_status = "approved"
-    target.rejection_reason = None
+    row = SignupDomain(domain=domain, enabled=True, is_default=False)
+    db.add(row)
     db.commit()
-    db.refresh(target)
-    return {"id": target.id, "username": target.username, "approval_status": target.approval_status}
+    db.refresh(row)
+    return _domain_dict(row)
 
 
-@app.post("/api/admin/signups/{user_id}/reject")
-def admin_reject_signup(
-    user_id: int,
-    payload: RejectRequest,
-    current_user: User = Depends(_require_admin),
+@app.patch("/api/admin/signup-domains/{domain_id}")
+def admin_toggle_signup_domain(
+    domain_id: int,
+    payload: SignupDomainToggle,
+    _: User = Depends(_require_admin),
     db: Session = Depends(get_db),
 ):
-    """Reject a pending Student/Faculty signup with a reason."""
-    if not payload.reason.strip():
-        raise HTTPException(status_code=400, detail="Rejection reason is required.")
-
-    target = db.query(User).filter(User.id == user_id).first()
-    if target is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-    if target.approval_status != "pending":
-        raise HTTPException(status_code=400, detail=f"Signup already {target.approval_status}.")
-
-    target.approval_status = "rejected"
-    target.rejection_reason = payload.reason.strip()
+    """Turn an allowed domain on or off. Turning every domain off reopens signup
+    to any email."""
+    row = db.query(SignupDomain).filter(SignupDomain.id == domain_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Domain not found.")
+    row.enabled = payload.enabled
     db.commit()
-    db.refresh(target)
-    return {"id": target.id, "username": target.username, "approval_status": target.approval_status, "rejection_reason": target.rejection_reason}
+    db.refresh(row)
+    return _domain_dict(row)
+
+
+@app.delete("/api/admin/signup-domains/{domain_id}")
+def admin_delete_signup_domain(
+    domain_id: int,
+    _: User = Depends(_require_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove a custom domain. The two seeded defaults can be turned off but not
+    deleted, so they always remain available as one-click options."""
+    row = db.query(SignupDomain).filter(SignupDomain.id == domain_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Domain not found.")
+    if row.is_default:
+        raise HTTPException(status_code=400, detail="Default domains can be turned off but not removed.")
+    domain = row.domain
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "id": domain_id, "domain": domain}
 
 
 @app.patch("/api/admin/users/{user_id}/committee-head")
